@@ -115,24 +115,35 @@ def parse_supplier_yml(source):
         else:
             tree = ET.parse(source)
             root = tree.getroot()
+        
         for offer in root.findall('.//offer'):
-            prom_code = offer.get('id') or offer.findtext('vendorCode') or ''
-            if not prom_code: continue
-            vendor_code = offer.findtext('vendorCode') or prom_code
+            product_code = offer.findtext('vendorCode') or offer.findtext('id') or ''
+            if not product_code: continue
+            
             size = next((p.text.strip() for p in offer.findall('param') if p.text and ('розмір' in p.get('name', '').lower() or 'размер' in p.get('name', '').lower() or '-' in p.get('name', ''))), '')
+            
             quantity_text = offer.findtext('quantity_in_stock') or offer.findtext('quantity')
             quantity = int(quantity_text) if quantity_text and quantity_text.isdigit() else (1 if offer.get('available') == 'true' else 0)
-            product_key = (vendor_code, size)
+            
+            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
+            price_text = offer.findtext('price')
+            price = float(price_text.strip().replace(',', '.')) if price_text and price_text.strip() else 0.0
+            
+            product_key = (product_code, size)
             if product_key in aggregated_offers:
                 aggregated_offers[product_key]['quantity'] += quantity
             else:
                 aggregated_offers[product_key] = {
-                    'prom_product_code': prom_code, 'product_code': vendor_code, 'size': size,
-                    'name': offer.findtext('name') or '', 'price': float(offer.findtext('price', '0').replace(',', '.')),
+                    'prom_product_code': offer.get('id') or product_code,
+                    'product_code': product_code, 'size': size,
+                    'name': offer.findtext('name') or '',
+                    'price': price,
                     'quantity': quantity
                 }
     except Exception as e:
-        app.logger.error(f"Ошибка YML: {e}"); return []
+        app.logger.error(f"Ошибка YML: {e}")
+        return []
+        
     return list(aggregated_offers.values())
 
 # --- ФУНКЦИИ СИНХРОНИЗАЦИИ ---
