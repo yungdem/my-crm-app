@@ -1,0 +1,71 @@
+{% extends "base.html" %}
+
+{% block title %}Ваши YML-ссылки{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Генератор YML-ссылок</h1>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header">Добавить новую ссылку</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('manage_generated_feeds') }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="mb-3">
+                <label for="name" class="form-label">Название (для себя, напр. "Поставщик футболок")</label>
+                <input type="text" name="name" id="name" class="form-control" required>
+            </div>
+            <div class="mb-3">
+                <label for="source_url" class="form-label">Оригинальная YML-ссылка поставщика</label>
+                <input type="url" name="source_url" id="source_url" class="form-control" placeholder="https://example.com/supplier.yml" required>
+            </div>
+            <button type="submit" class="btn btn-primary">Создать ссылку</button>
+        </form>
+    </div>
+</div>
+
+<h2 class="h4">Существующие ссылки</h2>
+<div class="table-responsive">
+    <table class="table table-hover align-middle">
+        <thead>
+            <tr>
+                <th>Название</th>
+                <th>Ваша "живая" ссылка</th>
+                <th class="text-end">Действие</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for feed in feeds %}
+            <tr>
+                <td>{{ feed.name }}</td>
+                <td>
+                    <div class="input-group">
+                        <input type="text" readonly class="form-control form-control-sm" value="{{ request.host_url }}feed/{{ feed.slug }}" id="feed-url-{{ feed.id }}">
+                        <button class="btn btn-outline-secondary btn-sm" onclick="copyToClipboard('feed-url-{{ feed.id }}')">Копировать</button>
+                    </div>
+                </td>
+                <td class="text-end">
+                    <form method="POST" action="{{ url_for('delete_generated_feed', feed_id=feed.id) }}" onsubmit="return confirm('Вы уверены, что хотите удалить эту ссылку?')">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <button type="submit" class="btn btn-danger btn-sm">Удалить</button>
+                    </form>
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="3" class="text-center p-4">Вы еще не создали ни одной ссылки.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<script>
+function copyToClipboard(elementId) {
+    var copyText = document.getElementById(elementId);
+    copyText.select();
+    copyText.setSelectionRange(0, 99999); // For mobile devices
+    document.execCommand("copy");
+    alert("Ссылка скопирована: " + copyText.value);
+}
+</script>
+{% endblock %}
