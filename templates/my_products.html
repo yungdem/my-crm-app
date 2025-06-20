@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Мои товары{% endblock %}
+{% block content %}
+<div class="d-flex justify-content-between flex-wrap flex-md-nowrap align-items-center pt-3 pb-2 mb-3 border-bottom">
+    <h1 class="h2">Мои товары</h1>
+    <div class="btn-toolbar mb-2 mb-md-0">
+        <a href="{{ url_for('export_prom_file') }}" class="btn btn-sm btn-dark me-2">Сгенерировать экспорт</a>
+        <form action="{{ url_for('view_my_products') }}" method="post" style="display:inline;">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action_type" value="compare_and_update">
+            <button type="submit" class="btn btn-sm btn-info" onclick="return confirm('Вы уверены?')">Сравнить и обновить</button>
+        </form>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="row g-3 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label">Импорт из XLSX</label>
+                <form action="{{ url_for('view_my_products') }}" method="post" enctype="multipart/form-data">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action_type" value="import_prom_file">
+                    <div class="input-group">
+                        <input type="file" name="file" class="form-control" required>
+                        <button type="submit" class="btn btn-primary">Загрузить</button>
+                    </div>
+                </form>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">Импорт по YML ссылке</label>
+                <form action="{{ url_for('view_my_products') }}" method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                    <input type="hidden" name="action_type" value="import_prom_yml_url">
+                    <div class="input-group">
+                        <input type="url" name="yml_url" class="form-control" placeholder="Вставьте YML ссылку..." required>
+                        <button type="submit" class="btn btn-success">Импорт</button>
+                    </div>
+                </form>
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">Поиск по артикулу</label>
+                <form method="GET" action="{{ url_for('view_my_products') }}">
+                    <div class="input-group">
+                        <input type="text" name="search" class="form-control" placeholder="Артикул..." value="{{ search_query or '' }}">
+                        <button type="submit" class="btn btn-outline-secondary"><i class="bi bi-search"></i></button>
+                        {% if search_query %}<a href="{{ url_for('view_my_products') }}" class="btn btn-outline-danger">Сброс</a>{% endif %}
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="table-responsive">
+    <table class="table table-sm table-hover table-bordered">
+        <thead class="table-light">
+            <tr>
+                <th>Артикул</th><th>Название</th><th>Размер</th><th>Цена</th>
+                <th>Цена пост.</th><th>Прибыль</th><th>Наличие</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for data in products_data %}
+            <tr>
+                <td>{{ data.product.product_code }}</td>
+                <td>{{ data.product.name }}</td>
+                <td>{{ data.product.size or '-' }}</td>
+                <td>{{ "%.2f"|format(data.product.price) }} грн</td>
+                <td>{{ "%.2f"|format(data.supplier_price) if data.supplier_price > 0 else '-' }}</td>
+                <td>
+                    {% if data.supplier_price > 0 %}
+                        <span class="{{ 'text-success' if data.net_profit > 0 else 'text-danger' }} fw-bold">{{ "%.2f"|format(data.net_profit) }} грн</span>
+                    {% else %} - {% endif %}
+                </td>
+                <td>
+                    {% if data.product.is_available %}
+                        <span class="badge bg-success">В наличии ({{ data.product.quantity }})</span>
+                    {% else %}
+                        <span class="badge bg-danger">Нет в наличии</span>
+                    {% endif %}
+                </td>
+            </tr>
+            {% else %}
+            <tr><td colspan="7" class="text-center p-4">Товары не найдены.</td></tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<div class="mt-4 d-flex justify-content-center">
+    {% if pagination %}
+        {{ pagination.links }}
+    {% endif %}
+</div>
+{% endblock %}
