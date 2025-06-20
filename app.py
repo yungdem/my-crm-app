@@ -6,13 +6,11 @@ import requests
 import xml.etree.ElementTree as ET
 import pandas as pd
 from werkzeug.utils import secure_filename
-from flask import Flask, request, render_template, redirect, url_for, flash, send_file
+from flask import Flask, request, render_template, redirect, url_for, flash, send_file, Response
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import UniqueConstraint, func
+from sqlalchemy import UniqueConstraint
 from flask_wtf.csrf import CSRFProtect
 from flask_paginate import Pagination, get_page_args
-from flask import Response
-
 
 # --- ИНИЦИАЛИЗАЦИЯ ---
 app = Flask(__name__)
@@ -30,6 +28,14 @@ os.makedirs(os.path.join(app.config['UPLOAD_FOLDER'], 'prom_exports'), exist_ok=
 os.makedirs(os.path.join(app.config['EXPORTS_FOLDER']), exist_ok=True)
 
 # --- МОДЕЛИ БАЗЫ ДАННЫХ ---
+class GeneratedFeed(db.Model):
+    __tablename__ = 'generated_feed'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    source_url = db.Column(db.String(500), nullable=False, unique=True)
+    slug = db.Column(db.String(120), nullable=False, unique=True, index=True) 
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(UTC))
+
 class Product(db.Model):
     __tablename__ = 'product'
     id = db.Column(db.Integer, primary_key=True)
@@ -78,8 +84,39 @@ with app.app_context():
 LAST_PROMLOAD_FILENAME = None
 
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
-def allowed_file(filename):
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in {'xlsx', 'xls'}
+def modify_source_yml_from_crm(source_url):
+    try:
+        products_db = Product.query.all()
+        product_map = {p.product_code: {'quantity': p.quantity, 'is_available': p.is_available} for p in products_db if p.product_code}
+        response = requests.get(source_url, timeout=120)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+        for offer in root.findall('.//offer'):
+            vendor_code = offer.findtext('vendorCode')
+            if not vendor_code:
+                continue
+            if vendor_code in product_map:
+                our_data = product_map[vendor_code]
+                new_availability = 'true' if our_data['is_available'] else 'false'
+                new_quantity = str(our_data['quantity'])
+                offer.set('available', new_availability)
+                quantity_tag = offer.find('quantity_in_stock') or offer.find('quantity')
+                if quantity_tag is not None:
+                    quantity_tag.text = new_quantity
+                else:
+                    ET.SubElement(offer, 'quantity_in_stock').text = new_quantity
+            else:
+                offer.set('available', 'false')
+                quantity_tag = offer.find('quantity_in_stock')
+                if quantity_tag is not None:
+                    quantity_tag.text = '0'
+        return {'status': 'success', 'content': ET.tostring(root, encoding='unicode')}
+    except requests.exceptions.RequestException as e:
+        return {'status': 'error', 'message': f"Не удалось скачать файл: {e}"}
+    except ET.ParseError as e:
+        return {'status': 'error', 'message': f"Ошибка структуры XML: {e}"}
+    except Exception as e:
+        return {'status': 'error', 'message': f"Неизвестная ошибка: {e}"}
 
 def parse_data_from_file(filepath):
     products_data = []
@@ -115,20 +152,14 @@ def parse_supplier_yml(source):
         else:
             tree = ET.parse(source)
             root = tree.getroot()
-        
         for offer in root.findall('.//offer'):
             product_code = offer.findtext('vendorCode') or offer.findtext('id') or ''
             if not product_code: continue
-            
             size = next((p.text.strip() for p in offer.findall('param') if p.text and ('розмір' in p.get('name', '').lower() or 'размер' in p.get('name', '').lower() or '-' in p.get('name', ''))), '')
-            
             quantity_text = offer.findtext('quantity_in_stock') or offer.findtext('quantity')
             quantity = int(quantity_text) if quantity_text and quantity_text.isdigit() else (1 if offer.get('available') == 'true' else 0)
-            
-            # --- ИСПРАВЛЕНИЕ ЗДЕСЬ ---
             price_text = offer.findtext('price')
             price = float(price_text.strip().replace(',', '.')) if price_text and price_text.strip() else 0.0
-            
             product_key = (product_code, size)
             if product_key in aggregated_offers:
                 aggregated_offers[product_key]['quantity'] += quantity
@@ -136,17 +167,13 @@ def parse_supplier_yml(source):
                 aggregated_offers[product_key] = {
                     'prom_product_code': offer.get('id') or product_code,
                     'product_code': product_code, 'size': size,
-                    'name': offer.findtext('name') or '',
-                    'price': price,
-                    'quantity': quantity
+                    'name': offer.findtext('name') or '', 'price': price, 'quantity': quantity
                 }
     except Exception as e:
         app.logger.error(f"Ошибка YML: {e}")
         return []
-        
     return list(aggregated_offers.values())
 
-# --- ФУНКЦИИ СИНХРОНИЗАЦИИ ---
 def sync_my_products(products_from_file):
     try:
         existing_map = {p.prom_product_code: p for p in Product.query.all()}
@@ -154,21 +181,16 @@ def sync_my_products(products_from_file):
         for data in products_from_file:
             code = data.get('prom_product_code')
             if not code: continue
-            
             clean_data = data.copy()
-            clean_data.pop('quantity', None)
-            clean_data.pop('is_available', None)
+            clean_data.pop('quantity', None); clean_data.pop('is_available', None)
             final_data = {k: v for k, v in clean_data.items() if k in Product.__table__.columns.keys()}
-
             if code in existing_map:
                 p = existing_map.pop(code)
                 for key, value in final_data.items(): setattr(p, key, value)
             else:
                 to_add.append(Product(**final_data, quantity=0, is_available=False))
-        
         for p in existing_map.values(): db.session.delete(p)
         if to_add: db.session.add_all(to_add)
-        
         db.session.commit()
         return {'status': 'success', 'count': len(products_from_file)}
     except Exception as e:
@@ -223,83 +245,59 @@ def get_prom_products_with_suppliers(search_query=None, page=1, per_page=30):
         net_profit = p.price - supplier_price if supplier_price > 0 else 0.0
         products_data.append({'product': p, 'supplier_price': supplier_price, 'net_profit': net_profit})
     return products_data, pagination
-    
-import pandas as pd
 
 def generate_prom_import_file():
     global LAST_PROMLOAD_FILENAME
     if not LAST_PROMLOAD_FILENAME:
-        flash('Сначала загрузите оригинальный файл выгрузки из Prom.ua.', 'error')
-        return None
-    
+        flash('Сначала загрузите оригинальный файл выгрузки из Prom.ua.', 'error'); return None
     original_prom_file = os.path.join(app.config['UPLOAD_FOLDER'], 'prom_exports', LAST_PROMLOAD_FILENAME)
     if not os.path.exists(original_prom_file):
-        flash(f'Оригинальный файл Prom.ua ({LAST_PROMLOAD_FILENAME}) не найден.', 'error')
-        return None
-
+        flash(f'Оригинальный файл Prom.ua ({LAST_PROMLOAD_FILENAME}) не найден.', 'error'); return None
     try:
         df_original = pd.read_excel(original_prom_file)
         products_db = Product.query.all()
         quantity_map = {str(p.prom_product_code): p.quantity for p in products_db}
-        # Создаем карту размеров, чтобы использовать их в ID
         size_map = {str(p.prom_product_code): p.size for p in products_db}
-
         def update_row(row):
             unique_id = str(row.get('Унікальний_ідентифікатор', '')).strip() or str(row.get('Код_товару', '')).strip()
-            
-            # Обновляем количество и наличие
             if unique_id in quantity_map:
                 new_quantity = quantity_map.get(unique_id, 0)
                 row['Кількість'] = new_quantity
                 row['Наявність'] = '+' if new_quantity > 0 else '-'
-            
-            # --- НАЧАЛО НОВОЙ ЛОГИКИ ГЕНЕРАЦИИ ID ---
-            # Генерируем случайную часть ID
             random_part = uuid.uuid4().hex[:10]
-            
-            # Получаем размер для этого товара
             size = size_map.get(unique_id)
-            
-            # Собираем ID в нужном формате
             if size:
                 row['Ідентифікатор_товару'] = f"{random_part}s{size}"
             else:
                 row['Ідентифікатор_товару'] = random_part
-            # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
-            
-            # Добавляем обязательное поле "Одиниця_виміру"
             if 'Одиниця_виміру' not in row or pd.isna(row.get('Одиниця_виміру')):
                 row['Одиниця_виміру'] = 'шт.'
-            
             return row
-
         df_updated = df_original.apply(update_row, axis=1)
-        
         timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
         export_filename = f'prom_update_{timestamp}.xlsx'
         export_path = os.path.join(app.config['EXPORTS_FOLDER'], export_filename)
-        
-        # Убедимся, что новая колонка есть в итоговом файле
         if 'Ідентифікатор_товару' not in df_updated.columns:
-            # Эта строка на случай, если apply не добавит колонку для пустого DataFrame
             df_updated['Ідентифікатор_товару'] = ''
-
         df_updated.to_excel(export_path, index=False)
-        
         flash(f'Файл для импорта "{export_filename}" успешно создан!', 'success')
         return export_path
     except Exception as e:
         flash(f'Ошибка при генерации файла для Prom.ua: {e}', 'error')
-        app.logger.error(f"Ошибка при генерации файла Prom.ua: {e}")
-        return None
-        
+        app.logger.error(f"Ошибка при генерации файла Prom.ua: {e}"); return None
+
 def get_potential_new_prom_products():
     return PotentialNewPromProduct.query.order_by(PotentialNewPromProduct.product_code).all()
 
 # --- МАРШРУТЫ FLASK ---
 @app.route('/')
 def dashboard():
-    stats = {'total_products': Product.query.count(), 'products_in_stock': Product.query.filter(Product.quantity > 0).count(), 'supplier_count': Supplier.query.count(), 'new_products_count': PotentialNewPromProduct.query.count()}
+    stats = {
+        'total_products': Product.query.count(), 
+        'products_in_stock': Product.query.filter(Product.quantity > 0).count(), 
+        'supplier_count': Supplier.query.count(), 
+        'new_products_count': PotentialNewPromProduct.query.count()
+    }
     return render_template('dashboard.html', stats=stats)
 
 @app.route('/products', methods=['GET', 'POST'])
@@ -318,7 +316,7 @@ def view_my_products():
                     data = parse_data_from_file(filepath)
                     if data:
                         result = sync_my_products(data)
-                        if result['status'] == 'success': flash(f'Синхронизация из файла завершена.', 'success')
+                        if result['status'] == 'success': flash('Синхронизация из файла завершена.', 'success')
                         else: flash(f"Ошибка: {result['message']}", 'error')
                     else: flash('Файл пуст или не удалось обработать.', 'warning')
                 except Exception as e: flash(f'Критическая ошибка: {e}', 'error')
@@ -331,7 +329,7 @@ def view_my_products():
                     data = parse_supplier_yml(yml_url)
                     if data:
                         result = sync_my_products(data)
-                        if result['status'] == 'success': flash(f'Синхронизация по YML завершена.', 'success')
+                        if result['status'] == 'success': flash('Синхронизация по YML завершена.', 'success')
                         else: flash(f"Ошибка: {result['message']}", 'error')
                     else: flash('Не удалось найти товары в YML.', 'warning')
                 except Exception as e: flash(f'Ошибка при импорте YML: {e}', 'danger')
@@ -361,20 +359,19 @@ def supplier_details(supplier_id):
 
 @app.route('/add_supplier', methods=['GET', 'POST'])
 def add_supplier_route():
-    form_data = request.form
     if request.method == 'POST':
-        supplier_id = form_data.get('supplier_id')
+        supplier_id = request.form.get('supplier_id')
         supplier = db.session.get(Supplier, int(supplier_id)) if supplier_id else Supplier()
         if not supplier_id: db.session.add(supplier)
-        supplier.name = form_data['name']
-        supplier.contact = form_data.get('contact', '')
-        supplier.contact_person = form_data.get('contact_person', '')
-        supplier.website = form_data.get('website', '')
+        supplier.name = request.form['name']
+        supplier.contact = request.form.get('contact', '')
+        supplier.contact_person = request.form.get('contact_person', '')
+        supplier.website = request.form.get('website', '')
         try:
             db.session.commit()
             flash('Поставщик успешно сохранен!', 'success')
         except Exception:
-            db.session.rollback(); flash(f'Ошибка: Имя "{form_data["name"]}" уже существует.', 'danger')
+            db.session.rollback(); flash(f'Ошибка: Имя "{request.form["name"]}" уже существует.', 'danger')
         return redirect(url_for('view_suppliers'))
     supplier = db.session.get(Supplier, int(request.args.get('id'))) if request.args.get('id') else None
     return render_template('add_supplier_form.html', supplier=supplier)
@@ -391,24 +388,6 @@ def delete_supplier_route(supplier_id):
         flash(f"Поставщик '{supplier.name}' удален.", 'success')
     return redirect(url_for('view_suppliers'))
 
-@app.route('/import/supplier/file/<int:supplier_id>', methods=['POST'])
-def import_supplier_file(supplier_id):
-    if not db.session.get(Supplier, supplier_id): return redirect(url_for('view_suppliers'))
-    file = request.files.get('file')
-    if not file or not file.filename:
-        flash("Файл не выбран.", "error"); return redirect(url_for('supplier_details', supplier_id=supplier_id))
-    try:
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], 'supplier_files', filename)
-        file.save(filepath)
-        data = parse_supplier_yml(filepath)
-        os.remove(filepath)
-        result = sync_supplier_products(supplier_id, data)
-        if result['status'] == 'success': flash(f'Синхронизация завершена.', 'success')
-        else: flash(f"Ошибка: {result['message']}", 'error')
-    except Exception as e: flash(f'Критическая ошибка: {e}', 'error')
-    return redirect(url_for('supplier_details', supplier_id=supplier_id))
-
 @app.route('/import/supplier/yml', methods=['POST'])
 def import_supplier_from_yml():
     yml_url, supplier_id = request.form.get('yml_url'), int(request.form.get('supplier_id'))
@@ -418,7 +397,7 @@ def import_supplier_from_yml():
             data = parse_supplier_yml(yml_url)
             if data:
                 result = sync_supplier_products(supplier_id, data)
-                if result['status'] == 'success': flash(f'Синхронизация по ссылке завершена.', 'success')
+                if result['status'] == 'success': flash('Синхронизация по ссылке завершена.', 'success')
                 else: flash(f"Ошибка: {result['message']}", 'error')
             else: flash('Не удалось найти товары в YML.', 'warning')
         except Exception as e: flash(f'Ошибка при импорте YML: {e}', 'danger')
@@ -428,86 +407,107 @@ def import_supplier_from_yml():
 def view_new_products():
     return render_template('new_products.html', products=get_potential_new_prom_products())
 
-@app.route('/approve_new_prom_product/<string:product_code>', methods=['POST'])
-def approve_new_prom_product(product_code):
-    flash("Функционал в разработке.", "info"); return redirect(url_for('view_new_products'))
-
-@app.route('/reject_new_prom_product/<string:product_code>', methods=['POST'])
-def reject_new_prom_product(product_code):
-    flash("Функционал в разработке.", "info"); return redirect(url_for('view_new_products'))
-    
 @app.route('/export/prom')
 def export_prom_file():
     export_path = generate_prom_import_file()
     return send_file(export_path, as_attachment=True) if export_path else redirect(url_for('view_my_products'))
     
 def generate_yml_export_content():
-    """
-    Берет YML-файл поставщика как ШАБЛОН, обновляет в нем наличие на основе
-    данных из CRM и отдает как готовый YML.
-    """
-    # Этот URL должен быть URL-адресом поставщика, который вы используете как основу
-    # В будущем его можно будет сделать настраиваемым
-    source_yml_url = "https://tcl.prom.ua/products_feed.xml?hash_tag=b99dca70923d1aba1cf1e670337a81bb"
-
     try:
-        # --- Шаг 1: Получаем актуальные остатки из нашей CRM ---
-        # Эта логика у нас уже есть и работает правильно
-        all_crm_products = Product.query.all()
-        crm_stock_map = {}
-        for p in all_crm_products:
-            # Ключ = (артикул, размер), Значение = количество
-            crm_stock_map[(p.product_code, p.size)] = p.quantity
-
-        # --- Шаг 2: Скачиваем и парсим YML-шаблон ---
-        response = requests.get(source_yml_url, timeout=120)
-        response.raise_for_status()
-        root = ET.fromstring(response.content)
-
-        # --- Шаг 3: Обновляем наличие в скачанном файле ---
-        offers = root.findall('.//offer')
-        for offer in offers:
-            vendor_code = offer.findtext('vendorCode') or ''
-            
-            # Находим размер этого товара в YML-шаблоне
-            size = next((p.text.strip() for p in offer.findall('param') if p.text and ('розмір' in p.get('name', '').lower() or 'размер' in p.get('name', '').lower())), '')
-
-            # Находим актуальное количество в нашей CRM по ключу (артикул, размер)
-            # Если такого товара нет в нашей CRM, его остаток будет 0
-            current_stock = crm_stock_map.get((vendor_code, size), 0)
-
-            # Обновляем теги и атрибуты в XML-дереве
-            offer.set('available', 'true' if current_stock > 0 else 'false')
-            
-            quantity_tag = offer.find('quantity_in_stock')
-            if quantity_tag is not None:
-                quantity_tag.text = str(current_stock)
-            else: # Если тега нет, создаем его
-                ET.SubElement(offer, 'quantity_in_stock').text = str(current_stock)
-        
-        # --- Шаг 4: Отдаем измененный YML ---
-        # Форматируем XML для красивого вывода
-        shop_element = root.find('shop')
-        if shop_element is not None:
-            ET.indent(shop_element)
-            
-        # Преобразуем все дерево XML обратно в строку
-        xml_string = ET.tostring(root, encoding='unicode', xml_declaration=True)
-        return xml_string
-
+        yml_catalog = ET.Element('yml_catalog', date=datetime.now(UTC).strftime('%Y-%m-%d %H:%M'))
+        shop = ET.SubElement(yml_catalog, 'shop')
+        ET.SubElement(shop, 'name').text = "CRM Export"
+        ET.SubElement(shop, 'company').text = "My Company"
+        ET.SubElement(shop, 'url').text = request.host_url
+        currencies = ET.SubElement(shop, 'currencies')
+        ET.SubElement(currencies, 'currency', id='UAH', rate='1')
+        categories = ET.SubElement(shop, 'categories')
+        ET.SubElement(categories, 'category', id='1').text = "Общая категория"
+        offers = ET.SubElement(shop, 'offers')
+        products_to_export = Product.query.all()
+        if not products_to_export:
+            return "<?xml version='1.0' encoding='UTF-8'?><error>Нет товаров для экспорта в CRM.</error>"
+        for product in products_to_export:
+            offer = ET.SubElement(offers, 'offer', id=str(product.prom_product_code), available=str(product.is_available).lower())
+            ET.SubElement(offer, 'price').text = str(product.price)
+            ET.SubElement(offer, 'currencyId').text = 'UAH'
+            ET.SubElement(offer, 'categoryId').text = '1'
+            ET.SubElement(offer, 'name').text = product.name
+            ET.SubElement(offer, 'vendorCode').text = product.product_code
+            if product.quantity > 0:
+                ET.SubElement(offer, 'quantity_in_stock').text = str(product.quantity)
+            else:
+                 ET.SubElement(offer, 'quantity_in_stock').text = '0'
+            if product.size:
+                param = ET.SubElement(offer, 'param', name='Размер')
+                param.text = product.size
+        ET.indent(yml_catalog)
+        return ET.tostring(yml_catalog, encoding='UTF-8', xml_declaration=True).decode('utf-8')
     except Exception as e:
         app.logger.error(f"Ошибка при генерации YML-фида: {e}")
         return f"<?xml version='1.0' encoding='UTF-8'?><error>Ошибка при генерации фида: {e}</error>"
 
-
 @app.route('/export.yml')
 def export_yml_feed():
-    """
-    Этот маршрут отдает сгенерированный YML файл.
-    """
     yml_content = generate_yml_export_content()
     return Response(yml_content, mimetype='application/xml')
     
+# --- БЛОК ДЛЯ УПРАВЛЕНИЯ "ЖИВЫМИ" ССЫЛКАМИ ---
+
+# --- Вставьте этот код вместо старых manage_generated_feeds и create_managed_feed ---
+
+@app.route('/feeds', methods=['GET', 'POST'])
+def manage_generated_feeds():
+    """
+    Страница для просмотра и управления ссылками.
+    Обрабатывает GET для показа страницы и POST для создания новой ссылки.
+    """
+    # Логика для создания новой ссылки (когда форма отправлена)
+    if request.method == 'POST':
+        name = request.form.get('name')
+        source_url = request.form.get('source_url')
+        
+        if not name or not source_url:
+            flash('Необходимо заполнить все поля.', 'warning')
+            return redirect(url_for('manage_generated_feeds'))
+
+        slug = uuid.uuid4().hex[:8]
+        new_feed = GeneratedFeed(name=name, source_url=source_url, slug=slug)
+        db.session.add(new_feed)
+        
+        try:
+            db.session.commit()
+            flash('Новая "живая" ссылка успешно создана!', 'success')
+        except Exception:
+            db.session.rollback()
+            flash('Ошибка: такая ссылка поставщика уже существует.', 'danger')
+        
+        return redirect(url_for('manage_generated_feeds'))
+    
+    # Логика для отображения страницы (когда просто зашли на URL)
+    feeds = GeneratedFeed.query.order_by(GeneratedFeed.created_at.desc()).all()
+    return render_template('generated_feeds.html', feeds=feeds)
+
+# --- Убедитесь, что другие функции с этими именами удалены ---
+
+@app.route('/feed/<slug>')
+def serve_generated_feed(slug):
+    feed_record = GeneratedFeed.query.filter_by(slug=slug).first_or_404()
+    result = modify_source_yml_from_crm(feed_record.source_url)
+    if result['status'] == 'success':
+        return Response(result['content'], mimetype='application/xml')
+    else:
+        error_xml = f"<?xml version='1.0' encoding='UTF-8'?><error><message>{result['message']}</message></error>"
+        return Response(error_xml, mimetype='application/xml', status=500)
+
+@app.route('/feeds/delete/<int:feed_id>', methods=['POST'])
+def delete_generated_feed(feed_id):
+    feed = db.session.get(GeneratedFeed, feed_id)
+    if feed:
+        db.session.delete(feed)
+        db.session.commit()
+        flash('Ссылка успешно удалена.', 'success')
+    return redirect(url_for('manage_generated_feeds'))
     
 # --- ЗАПУСК ПРИЛОЖЕНИЯ ---
 if __name__ == '__main__':
