@@ -443,50 +443,56 @@ def export_prom_file():
     
 def generate_yml_export_content():
     """
-    Генерирует содержимое YML-файла на основе данных из базы.
+    Берет YML-файл по ссылке как шаблон, обновляет в нем наличие и количество
+    на основе данных из CRM и отдает как готовый YML.
     """
-    # Создаем базовую структуру YML
-    yml_catalog = ET.Element('yml_catalog', date=datetime.now(UTC).strftime('%Y-%m-%d %H:%M'))
-    shop = ET.SubElement(yml_catalog, 'shop')
-    
-    ET.SubElement(shop, 'name').text = "My CRM Export"
-    ET.SubElement(shop, 'company').text = "My Company"
-    ET.SubElement(shop, 'url').text = request.host_url
-    
-    currencies = ET.SubElement(shop, 'currencies')
-    ET.SubElement(currencies, 'currency', id='UAH', rate='1')
-    
-    categories = ET.SubElement(shop, 'categories')
-    # Здесь можно добавить логику для экспорта категорий, если нужно
-    ET.SubElement(categories, 'category', id='1').text = "Общая категория"
-    
-    offers = ET.SubElement(shop, 'offers')
-    
-    # Получаем все наши товары с актуальным наличием
-    products_to_export = Product.query.all()
-    
-    for product in products_to_export:
-        offer = ET.SubElement(offers, 'offer', id=str(product.prom_product_code), available=str(product.is_available).lower())
-        
-        ET.SubElement(offer, 'name').text = product.name
-        ET.SubElement(offer, 'vendorCode').text = product.product_code
-        ET.SubElement(offer, 'price').text = str(product.price)
-        ET.SubElement(offer, 'currencyId').text = 'UAH'
-        ET.SubElement(offer, 'categoryId').text = '1' # Используем ID общей категории
-        ET.SubElement(offer, 'quantity_in_stock').text = str(product.quantity)
-        
-        if product.size:
-            param = ET.SubElement(offer, 'param', name='Размер')
-            param.text = product.size
-        
-        if product.color:
-            param = ET.SubElement(offer, 'param', name='Цвет')
-            param.text = product.color
+    # ВАЖНО: В будущем этот URL лучше сделать настраиваемым, а не жестко прописанным
+    source_yml_url = "https://tcl.prom.ua/products_feed.xml?hash_tag=b99dca70923d1aba1cf1e670337a81bb"
 
-    # Преобразуем XML-дерево в строку с правильным форматированием
-    ET.indent(yml_catalog)
-    xml_string = ET.tostring(yml_catalog, encoding='unicode', xml_declaration=True)
-    return xml_string
+    try:
+        # --- Шаг 1: Получаем актуальные остатки из нашей CRM ---
+        # Эта логика похожа на ту, что в compare_and_update_prom_quantities
+        all_supplier_products = SupplierUploadedProduct.query.all()
+        crm_stock_map = {}
+        for sp in all_supplier_products:
+            key = (sp.product_code, sp.size)
+            crm_stock_map[key] = crm_stock_map.get(key, 0) + sp.quantity
+
+        # --- Шаг 2: Скачиваем и парсим YML-шаблон ---
+        response = requests.get(source_yml_url, timeout=120)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        # --- Шаг 3: Обновляем наличие в скачанном файле ---
+        offers = root.findall('.//offer')
+        for offer in offers:
+            vendor_code = offer.findtext('vendorCode') or ''
+            
+            # Находим размер этого товара в YML-шаблоне
+            size = next((p.text.strip() for p in offer.findall('param') if p.text and ('розмір' in p.get('name', '').lower() or 'размер' in p.get('name', '').lower())), '')
+
+            # Находим актуальное количество в нашей CRM по ключу (артикул, размер)
+            current_stock = crm_stock_map.get((vendor_code, size), 0)
+
+            # Обновляем теги в XML
+            offer.set('available', 'true' if current_stock > 0 else 'false')
+            
+            quantity_tag = offer.find('quantity_in_stock')
+            if quantity_tag is not None:
+                quantity_tag.text = str(current_stock)
+            else: # Если тега нет, создаем его
+                ET.SubElement(offer, 'quantity_in_stock').text = str(current_stock)
+        
+        # --- Шаг 4: Отдаем измененный YML ---
+        ET.indent(root.find('shop'))
+        # Преобразуем все дерево XML обратно в строку
+        xml_string = ET.tostring(root, encoding='unicode', xml_declaration=True)
+        return xml_string
+
+    except Exception as e:
+        app.logger.error(f"Ошибка при генерации YML-фида: {e}")
+        # В случае ошибки возвращаем XML с сообщением об ошибке
+        return f"<?xml version='1.0' encoding='UTF-8'?><error>Ошибка при генерации фида: {e}</error>"
 
 
 @app.route('/export.yml')
