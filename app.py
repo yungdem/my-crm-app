@@ -443,20 +443,21 @@ def export_prom_file():
     
 def generate_yml_export_content():
     """
-    Берет YML-файл по ссылке как шаблон, обновляет в нем наличие и количество
-    на основе данных из CRM и отдает как готовый YML.
+    Берет YML-файл поставщика как ШАБЛОН, обновляет в нем наличие на основе
+    данных из CRM и отдает как готовый YML.
     """
-    # ВАЖНО: В будущем этот URL лучше сделать настраиваемым, а не жестко прописанным
+    # Этот URL должен быть URL-адресом поставщика, который вы используете как основу
+    # В будущем его можно будет сделать настраиваемым
     source_yml_url = "https://tcl.prom.ua/products_feed.xml?hash_tag=b99dca70923d1aba1cf1e670337a81bb"
 
     try:
         # --- Шаг 1: Получаем актуальные остатки из нашей CRM ---
-        # Эта логика похожа на ту, что в compare_and_update_prom_quantities
-        all_supplier_products = SupplierUploadedProduct.query.all()
+        # Эта логика у нас уже есть и работает правильно
+        all_crm_products = Product.query.all()
         crm_stock_map = {}
-        for sp in all_supplier_products:
-            key = (sp.product_code, sp.size)
-            crm_stock_map[key] = crm_stock_map.get(key, 0) + sp.quantity
+        for p in all_crm_products:
+            # Ключ = (артикул, размер), Значение = количество
+            crm_stock_map[(p.product_code, p.size)] = p.quantity
 
         # --- Шаг 2: Скачиваем и парсим YML-шаблон ---
         response = requests.get(source_yml_url, timeout=120)
@@ -472,9 +473,10 @@ def generate_yml_export_content():
             size = next((p.text.strip() for p in offer.findall('param') if p.text and ('розмір' in p.get('name', '').lower() or 'размер' in p.get('name', '').lower())), '')
 
             # Находим актуальное количество в нашей CRM по ключу (артикул, размер)
+            # Если такого товара нет в нашей CRM, его остаток будет 0
             current_stock = crm_stock_map.get((vendor_code, size), 0)
 
-            # Обновляем теги в XML
+            # Обновляем теги и атрибуты в XML-дереве
             offer.set('available', 'true' if current_stock > 0 else 'false')
             
             quantity_tag = offer.find('quantity_in_stock')
@@ -484,14 +486,17 @@ def generate_yml_export_content():
                 ET.SubElement(offer, 'quantity_in_stock').text = str(current_stock)
         
         # --- Шаг 4: Отдаем измененный YML ---
-        ET.indent(root.find('shop'))
+        # Форматируем XML для красивого вывода
+        shop_element = root.find('shop')
+        if shop_element is not None:
+            ET.indent(shop_element)
+            
         # Преобразуем все дерево XML обратно в строку
         xml_string = ET.tostring(root, encoding='unicode', xml_declaration=True)
         return xml_string
 
     except Exception as e:
         app.logger.error(f"Ошибка при генерации YML-фида: {e}")
-        # В случае ошибки возвращаем XML с сообщением об ошибке
         return f"<?xml version='1.0' encoding='UTF-8'?><error>Ошибка при генерации фида: {e}</error>"
 
 
