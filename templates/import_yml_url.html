@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+
+{% block title %}Импорт YML по ссылке{% endblock %}
+
+{% block content %}
+<div class="container mt-4">
+    <h2 class="mb-4">Импорт товаров поставщика из YML по ссылке</h2>
+
+    <form action="{{ url_for('import_yml_from_url') }}" method="post">
+        <div class="mb-3">
+            <label for="yml_url" class="form-label">URL YML-выгрузки</label>
+            <input type="url" class="form-control" id="yml_url" name="yml_url" placeholder="https://example.com/products.yml" required>
+        </div>
+        <div class="mb-3">
+            <label for="supplier_id" class="form-label">Выберите поставщика</label>
+            <select class="form-select" id="supplier_id" name="supplier_id" required>
+                {% for supplier in suppliers %} {# Вам нужно будет передать список поставщиков из app.py #}
+                    <option value="{{ supplier.id }}">{{ supplier.name }}</option>
+                {% else %}
+                    <option value="">Нет доступных поставщиков. Добавьте поставщика сначала.</option>
+                {% endfor %}
+            </select>
+        </div>
+        <button type="submit" class="btn btn-primary">Импортировать YML</button>
+    </form>
+</div>
+{% endblock %}
